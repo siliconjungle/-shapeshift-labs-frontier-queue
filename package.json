@@ -1,0 +1,63 @@
+{
+  "name": "@shapeshift-labs/frontier-queue",
+  "version": "0.1.0",
+  "description": "Serializable durable queue state, leases, retries, dedupe, dead-letter records, and replay evidence for Frontier apps.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/siliconjungle/-shapeshift-labs-frontier-queue.git"
+  },
+  "homepage": "https://github.com/siliconjungle/-shapeshift-labs-frontier-queue#readme",
+  "bugs": {
+    "url": "https://github.com/siliconjungle/-shapeshift-labs-frontier-queue/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "benchmarks/package-bench.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "npm run build && npm run typecheck && node test/smoke.mjs && node test/fuzz.mjs --cases 600",
+    "readme:packages": "node benchmarks/package-readme-sections.mjs",
+    "readme:packages:check": "node benchmarks/package-readme-sections.mjs --check",
+    "prepack": "npm run readme:packages:check && npm run test",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
+    "fuzz": "npm run build && node test/fuzz.mjs",
+    "bench": "npm run build && node benchmarks/package-bench.mjs --out benchmarks/results/frontier-queue-package-bench-latest.json",
+    "pack:dry": "npm run readme:packages:check && npm pack --dry-run"
+  },
+  "keywords": [
+    "frontier",
+    "queue",
+    "durable",
+    "retry",
+    "dead-letter",
+    "lease",
+    "dedupe",
+    "patch",
+    "evidence"
+  ],
+  "dependencies": {
+    "@shapeshift-labs/frontier": "0.1.9"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
