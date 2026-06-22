@@ -25,7 +25,7 @@ const enqueued: FrontierQueueMutation = enqueueQueueJob(state, {
 }, { now: 1 });
 state = enqueued.state;
 
-const leased = leaseQueueJobs(state, { queue: 'typed', workerId: 'worker-1', count: 1, now: 2 });
+const leased = leaseQueueJobs(state, { queue: 'typed', workerId: 'worker-1', count: 1, jobIds: ['job_1'], now: 2 });
 const job: FrontierQueueJob | undefined = leased.jobs?.[0];
 const evidence: FrontierQueueEvidence = leased.evidence;
 

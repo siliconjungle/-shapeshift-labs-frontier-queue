@@ -264,6 +264,7 @@ export interface FrontierQueueEvidence {
 
 export interface FrontierQueueLeaseInput {
   queue?: string;
+  jobIds?: readonly string[];
   workerId: string;
   now?: number;
   count?: number;
@@ -454,13 +455,14 @@ export function leaseQueueJobs(state: FrontierQueueState, input: FrontierQueueLe
   const next = cloneStateForMutation(before);
   const now = normalizeTime(input.now);
   const count = Math.max(1, Math.floor(input.count || 1));
+  const allowedJobIds = input.jobIds ? new Set(input.jobIds.map(String)) : undefined;
   const patch: Patch = [];
   const events: FrontierQueueEvent[] = [];
   const leased: FrontierQueueJob[] = [];
   const lockedGroups = createLockedGroups(next);
 
   for (let i = 0; i < count; i++) {
-    const index = findNextReadyJobIndex(next, now, input.queue, lockedGroups);
+    const index = findNextReadyJobIndex(next, now, input.queue, lockedGroups, allowedJobIds);
     if (index === -1) break;
     const current = next.jobs[index];
     const job = cloneJob(current);
@@ -1095,11 +1097,18 @@ function createLockedGroups(state: FrontierQueueState): Set<string> {
   return lockedGroups;
 }
 
-function findNextReadyJobIndex(state: FrontierQueueState, now: number, queue: string | undefined, lockedGroups: Set<string>): number {
+function findNextReadyJobIndex(
+  state: FrontierQueueState,
+  now: number,
+  queue: string | undefined,
+  lockedGroups: Set<string>,
+  allowedJobIds?: ReadonlySet<string>
+): number {
   let bestIndex = -1;
   for (let index = 0; index < state.jobs.length; index++) {
     const job = state.jobs[index];
     if (queue && job.queue !== queue) continue;
+    if (allowedJobIds && !allowedJobIds.has(job.id)) continue;
     if (!READY_STATUSES.has(job.status) || job.availableAt > now) continue;
     if (job.groupKey && lockedGroups.has(groupScope(job.queue, job.groupKey))) continue;
     if (bestIndex === -1 || compareReadyJobs(job, state.jobs[bestIndex]) < 0) bestIndex = index;

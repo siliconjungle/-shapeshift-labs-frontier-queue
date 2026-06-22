@@ -77,8 +77,21 @@ assert.strictEqual(mutation.outcome, 'leased');
 assert.deepStrictEqual(mutation.jobs.map((job) => job.id), ['solo', 'alpha-high']);
 assert.strictEqual(mutation.jobs.filter((job) => job.groupKey === 'alpha').length, 1);
 groupState = mutation.state;
+const firstGroupLeaseJobs = mutation.jobs;
 
-const solo = mutation.jobs.find((job) => job.id === 'solo');
+let selectedState = createQueueState({ id: 'selected.queue' });
+selectedState = enqueueQueueJob(selectedState, { id: 'selected-low', priority: 1 }, { now: 1 }).state;
+selectedState = enqueueQueueJob(selectedState, { id: 'selected-high', priority: 100 }, { now: 2 }).state;
+mutation = leaseQueueJobs(selectedState, { workerId: 'selector', count: 1, jobIds: ['selected-low'], now: 3 });
+assertReplay(selectedState, mutation);
+assert.strictEqual(mutation.outcome, 'leased');
+assert.deepStrictEqual(mutation.jobs.map((job) => job.id), ['selected-low']);
+selectedState = mutation.state;
+mutation = leaseQueueJobs(selectedState, { workerId: 'selector', count: 1, jobIds: ['missing-job'], now: 4 });
+assertReplay(selectedState, mutation);
+assert.strictEqual(mutation.outcome, 'empty');
+
+const solo = firstGroupLeaseJobs.find((job) => job.id === 'solo');
 mutation = completeQueueJob(groupState, {
   jobId: solo.id,
   leaseToken: solo.lease.token,
