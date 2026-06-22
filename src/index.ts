@@ -17,6 +17,8 @@ export const FRONTIER_QUEUE_EVENT_KIND = 'frontier.queue.event';
 export const FRONTIER_QUEUE_EVENT_VERSION = 1;
 export const FRONTIER_QUEUE_DEAD_LETTER_KIND = 'frontier.queue.dead-letter';
 export const FRONTIER_QUEUE_DEAD_LETTER_VERSION = 1;
+export const FRONTIER_QUEUE_TERMINAL_OUTCOME_KIND = 'frontier.queue.terminal-outcome';
+export const FRONTIER_QUEUE_TERMINAL_OUTCOME_VERSION = 1;
 export const FRONTIER_QUEUE_EVIDENCE_KIND = 'frontier.queue.evidence';
 export const FRONTIER_QUEUE_EVIDENCE_VERSION = 1;
 
@@ -37,6 +39,7 @@ export type FrontierQueueDedupeMode =
   | 'unsafe-dedupe'
   | 'merge-payload';
 export type FrontierQueueJitterMode = 'none' | 'full' | 'equal';
+export type FrontierQueueTerminalOutcomeStatus = 'completed' | 'dead' | 'cancelled' | 'deduped' | 'rejected';
 
 export interface FrontierQueueRetryPolicyInput {
   maxAttempts?: number;
@@ -79,6 +82,7 @@ export interface FrontierQueueStateInput {
   defaults?: FrontierQueueDefaultsInput;
   jobs?: readonly FrontierQueueJob[];
   deadLetters?: readonly FrontierQueueDeadLetter[];
+  terminalOutcomes?: readonly FrontierQueueTerminalOutcome[];
   events?: readonly FrontierQueueEvent[];
   sequence?: number;
   metadata?: JsonObject;
@@ -91,6 +95,7 @@ export interface FrontierQueueState {
   defaults: FrontierQueueDefaults;
   jobs: FrontierQueueJob[];
   deadLetters: FrontierQueueDeadLetter[];
+  terminalOutcomes: FrontierQueueTerminalOutcome[];
   events: FrontierQueueEvent[];
   sequence: number;
   metadata?: JsonObject;
@@ -194,6 +199,41 @@ export interface FrontierQueueDeadLetter {
   metadata?: JsonObject;
 }
 
+export interface FrontierQueueTerminalOutcomeInput {
+  id?: string;
+  queue?: string;
+  dedupeKey: string;
+  status: FrontierQueueTerminalOutcomeStatus;
+  jobId?: string;
+  at?: number | string;
+  source?: string;
+  reason?: string;
+  metadata?: JsonObject;
+}
+
+export interface FrontierQueueTerminalOutcome {
+  kind: typeof FRONTIER_QUEUE_TERMINAL_OUTCOME_KIND;
+  version: typeof FRONTIER_QUEUE_TERMINAL_OUTCOME_VERSION;
+  id: string;
+  queue: string;
+  dedupeKey: string;
+  status: FrontierQueueTerminalOutcomeStatus;
+  jobId?: string;
+  at: number;
+  source?: string;
+  reason?: string;
+  metadata?: JsonObject;
+}
+
+export interface FrontierQueueTerminalProjectionInput {
+  states?: readonly FrontierQueueState[];
+  jobs?: readonly FrontierQueueJob[];
+  deadLetters?: readonly FrontierQueueDeadLetter[];
+  outcomes?: readonly FrontierQueueTerminalOutcomeInput[];
+  now?: number;
+  source?: string;
+}
+
 export interface FrontierQueueMutation {
   state: FrontierQueueState;
   patch: Patch;
@@ -202,6 +242,7 @@ export interface FrontierQueueMutation {
   job?: FrontierQueueJob;
   jobs?: FrontierQueueJob[];
   deadLetter?: FrontierQueueDeadLetter;
+  terminalOutcomes?: FrontierQueueTerminalOutcome[];
   evidence: FrontierQueueEvidence;
 }
 
@@ -217,6 +258,7 @@ export interface FrontierQueueEvidence {
   readyCount: number;
   leasedCount: number;
   deadCount: number;
+  terminalOutcomeCount: number;
   replayVerified: boolean;
 }
 
@@ -291,9 +333,24 @@ export interface FrontierQueueInspectionQueue {
 interface QueueIndexes {
   byId: Map<string, number>;
   dedupe: Map<string, number>;
+  terminalDedupe: Map<string, QueueTerminalDedupeMatch>;
+}
+
+interface QueueTerminalDedupeMatch {
+  queue: string;
+  dedupeKey: string;
+  status: FrontierQueueTerminalOutcomeStatus;
+  at: number;
+  source: string;
+  jobId?: string;
+  jobIndex?: number;
+  outcomeId?: string;
+  reason?: string;
 }
 
 const ACTIVE_DEDUPE_STATUSES = new Set<FrontierQueueJobStatus>(['queued', 'retrying', 'leased']);
+const TERMINAL_DEDUPE_STATUSES = new Set<FrontierQueueJobStatus>(['completed', 'dead', 'cancelled', 'deduped']);
+const TERMINAL_OUTCOME_STATUSES = new Set<FrontierQueueTerminalOutcomeStatus>(['completed', 'dead', 'cancelled', 'deduped', 'rejected']);
 const READY_STATUSES = new Set<FrontierQueueJobStatus>(['queued', 'retrying']);
 const EMPTY_PATCH: Patch = [];
 
@@ -305,6 +362,7 @@ export function createQueueState(input: FrontierQueueStateInput = {}): FrontierQ
     defaults: normalizeDefaults(input.defaults),
     jobs: (input.jobs || []).map((job) => cloneJob(job)),
     deadLetters: (input.deadLetters || []).map((dead) => cloneDeadLetter(dead)),
+    terminalOutcomes: (input.terminalOutcomes || []).map((outcome) => cloneTerminalOutcome(outcome)),
     events: (input.events || []).map((event) => cloneEvent(event)),
     sequence: Math.max(0, Math.floor(input.sequence || 0)),
     metadata: cloneObject(input.metadata)
@@ -318,7 +376,7 @@ export function enqueueQueueJob(state: FrontierQueueState, input: FrontierQueueJ
   const indexes = compileQueueIndexes(next);
   const dedupeMode = input.dedupeMode || (input.dedupeKey ? 'drop' : 'none');
   let outcome = 'enqueued';
-  let job: FrontierQueueJob;
+  let job: FrontierQueueJob | undefined;
   const patch: Patch = [];
 
   if (input.dedupeKey && dedupeMode !== 'none') {
@@ -361,6 +419,20 @@ export function enqueueQueueJob(state: FrontierQueueState, input: FrontierQueueJ
       next.events[next.events.length] = event;
       patch[patch.length] = [OP_APPEND, ['events'], patchValues([cloneEvent(event)])];
       return finishMutation(before, next, patch, [event], outcome, job);
+    }
+  }
+
+  if (input.dedupeKey && dedupeMode !== 'none') {
+    const terminal = indexes.terminalDedupe.get(dedupeScope(input.queue || next.defaults.queue, input.dedupeKey));
+    if (terminal) {
+      outcome = terminal.status === 'rejected' ? 'terminal-rejected' : 'terminal-deduped';
+      job = terminal.jobIndex === undefined ? undefined : next.jobs[terminal.jobIndex];
+      return appendOnlyEvent(before, next, createEvent(next, 'queue.job.' + outcome, now, {
+        jobId: terminal.jobId,
+        queue: terminal.queue,
+        reason: terminal.status,
+        metadata: metadataWithTerminalDedupe(input.dedupeKey, terminal)
+      }), outcome, job);
     }
   }
 
@@ -435,6 +507,8 @@ export function completeQueueJob(state: FrontierQueueState, input: FrontierQueue
   job.lease = undefined;
   job.metadata = mergeObjects(job.metadata, input.metadata);
   next.jobs[index] = job;
+  const patch: Patch = [[OP_SET, ['jobs', index], patchValue(cloneJob(job))]];
+  const terminalOutcome = upsertTerminalOutcome(next, patch, terminalOutcomeFromJob(next, job, 'queue.job.completed'));
   const event = createEvent(next, 'queue.job.completed', now, {
     jobId: job.id,
     queue: job.queue,
@@ -442,10 +516,8 @@ export function completeQueueJob(state: FrontierQueueState, input: FrontierQueue
     metadata: input.metadata
   });
   next.events[next.events.length] = event;
-  return finishMutation(before, next, [
-    [OP_SET, ['jobs', index], patchValue(cloneJob(job))],
-    [OP_APPEND, ['events'], patchValues([cloneEvent(event)])]
-  ], [event], 'completed', job);
+  patch[patch.length] = [OP_APPEND, ['events'], patchValues([cloneEvent(event)])];
+  return finishMutation(before, next, patch, [event], 'completed', job, undefined, undefined, terminalOutcome ? [terminalOutcome] : undefined);
 }
 
 export function failQueueJob(state: FrontierQueueState, input: FrontierQueueFailInput): FrontierQueueMutation {
@@ -469,6 +541,7 @@ export function failQueueJob(state: FrontierQueueState, input: FrontierQueueFail
   let eventType = 'queue.job.failed';
   let outcome = 'failed';
   let deadLetter: FrontierQueueDeadLetter | undefined;
+  let terminalOutcome: FrontierQueueTerminalOutcome | undefined;
   if (retryable) {
     const delay = calculateRetryDelayMs(job.retry, nextDeliveryCount, job.id);
     job.status = 'retrying';
@@ -488,6 +561,9 @@ export function failQueueJob(state: FrontierQueueState, input: FrontierQueueFail
 
   next.jobs[index] = job;
   patch.unshift([OP_SET, ['jobs', index], patchValue(cloneJob(job))]);
+  if (deadLetter) {
+    terminalOutcome = upsertTerminalOutcome(next, patch, terminalOutcomeFromJob(next, job, 'queue.job.dead-lettered'));
+  }
   const event = createEvent(next, eventType, now, {
     jobId: job.id,
     queue: job.queue,
@@ -497,7 +573,7 @@ export function failQueueJob(state: FrontierQueueState, input: FrontierQueueFail
   });
   next.events[next.events.length] = event;
   patch[patch.length] = [OP_APPEND, ['events'], patchValues([cloneEvent(event)])];
-  return finishMutation(before, next, patch, [event], outcome, job, undefined, deadLetter);
+  return finishMutation(before, next, patch, [event], outcome, job, undefined, deadLetter, terminalOutcome ? [terminalOutcome] : undefined);
 }
 
 export function expireQueueLeases(state: FrontierQueueState, input: FrontierQueueExpireInput = {}): FrontierQueueMutation {
@@ -507,6 +583,7 @@ export function expireQueueLeases(state: FrontierQueueState, input: FrontierQueu
   const patch: Patch = [];
   const events: FrontierQueueEvent[] = [];
   const jobs: FrontierQueueJob[] = [];
+  const terminalOutcomes: FrontierQueueTerminalOutcome[] = [];
 
   for (let index = 0; index < next.jobs.length; index++) {
     const current = next.jobs[index];
@@ -526,6 +603,8 @@ export function expireQueueLeases(state: FrontierQueueState, input: FrontierQueu
       next.deadLetters[next.deadLetters.length] = deadLetter;
       patch[patch.length] = [OP_APPEND, ['deadLetters'], patchValues([cloneDeadLetter(deadLetter)])];
       eventType = 'queue.job.dead-lettered';
+      const terminalOutcome = upsertTerminalOutcome(next, patch, terminalOutcomeFromJob(next, job, 'queue.job.dead-lettered'));
+      if (terminalOutcome) terminalOutcomes[terminalOutcomes.length] = terminalOutcome;
     } else {
       job.status = 'retrying';
       job.availableAt = now;
@@ -545,7 +624,17 @@ export function expireQueueLeases(state: FrontierQueueState, input: FrontierQueu
     for (const event of events) next.events[next.events.length] = event;
     patch[patch.length] = [OP_APPEND, ['events'], patchValues(events.map(cloneEvent))];
   }
-  return finishMutation(before, next, patch, events, jobs.length ? 'leases-expired' : 'none-expired', jobs[0], jobs);
+  return finishMutation(
+    before,
+    next,
+    patch,
+    events,
+    jobs.length ? 'leases-expired' : 'none-expired',
+    jobs[0],
+    jobs,
+    undefined,
+    terminalOutcomes.length ? terminalOutcomes : undefined
+  );
 }
 
 export function retryQueueDeadLetter(state: FrontierQueueState, input: FrontierQueueRetryDeadLetterInput): FrontierQueueMutation {
@@ -589,16 +678,55 @@ export function cancelQueueJob(state: FrontierQueueState, input: FrontierQueueCa
   job.updatedAt = now;
   job.lease = undefined;
   next.jobs[index] = job;
+  const patch: Patch = [[OP_SET, ['jobs', index], patchValue(cloneJob(job))]];
+  const terminalOutcome = upsertTerminalOutcome(next, patch, terminalOutcomeFromJob(next, job, 'queue.job.cancelled'));
   const event = createEvent(next, 'queue.job.cancelled', now, {
     jobId: job.id,
     queue: job.queue,
     reason: input.reason || 'cancelled'
   });
   next.events[next.events.length] = event;
-  return finishMutation(before, next, [
-    [OP_SET, ['jobs', index], patchValue(cloneJob(job))],
-    [OP_APPEND, ['events'], patchValues([cloneEvent(event)])]
-  ], [event], 'cancelled', job);
+  patch[patch.length] = [OP_APPEND, ['events'], patchValues([cloneEvent(event)])];
+  return finishMutation(before, next, patch, [event], 'cancelled', job, undefined, undefined, terminalOutcome ? [terminalOutcome] : undefined);
+}
+
+export function projectQueueTerminalOutcomes(state: FrontierQueueState, input: FrontierQueueTerminalProjectionInput = {}): FrontierQueueMutation {
+  const before = createQueueState(state);
+  const next = cloneStateForMutation(before);
+  const now = normalizeTime(input.now);
+  const patch: Patch = [];
+  const terminalOutcomes: FrontierQueueTerminalOutcome[] = [];
+  const candidates = collectTerminalOutcomeCandidates(next, input, now);
+
+  for (const candidate of candidates) {
+    const terminalOutcome = upsertTerminalOutcome(next, patch, candidate);
+    if (terminalOutcome) terminalOutcomes[terminalOutcomes.length] = terminalOutcome;
+  }
+
+  if (terminalOutcomes.length) {
+    const event = createEvent(next, 'queue.terminal-outcomes.projected', now, {
+      reason: 'projected',
+      metadata: {
+        projected: terminalOutcomes.length,
+        source: input.source
+      }
+    });
+    next.events[next.events.length] = event;
+    patch[patch.length] = [OP_APPEND, ['events'], patchValues([cloneEvent(event)])];
+    return finishMutation(
+      before,
+      next,
+      patch,
+      [event],
+      'terminal-outcomes-projected',
+      undefined,
+      undefined,
+      undefined,
+      terminalOutcomes
+    );
+  }
+
+  return finishMutation(before, next, patch, [], 'terminal-outcomes-unchanged');
 }
 
 export function inspectQueueState(state: FrontierQueueState, input: { now?: number } = {}): FrontierQueueInspection {
@@ -656,6 +784,7 @@ export function createQueueEvidence(state: FrontierQueueState, patch: Patch = EM
     readyCount: inspection.ready,
     leasedCount: inspection.leased,
     deadCount: inspection.dead,
+    terminalOutcomeCount: state.terminalOutcomes.length,
     replayVerified: true
   };
 }
@@ -718,7 +847,8 @@ function finishMutation(
   outcome: string,
   job?: FrontierQueueJob,
   jobs?: FrontierQueueJob[],
-  deadLetter?: FrontierQueueDeadLetter
+  deadLetter?: FrontierQueueDeadLetter,
+  terminalOutcomes?: FrontierQueueTerminalOutcome[]
 ): FrontierQueueMutation {
   if (before.sequence !== next.sequence) {
     patch[patch.length] = [OP_SET, ['sequence'], next.sequence];
@@ -733,6 +863,7 @@ function finishMutation(
     job,
     jobs,
     deadLetter,
+    terminalOutcomes,
     evidence: {
       kind: FRONTIER_QUEUE_EVIDENCE_KIND,
       version: FRONTIER_QUEUE_EVIDENCE_VERSION,
@@ -745,6 +876,7 @@ function finishMutation(
       readyCount: inspection.ready,
       leasedCount: inspection.leased,
       deadCount: inspection.dead,
+      terminalOutcomeCount: next.terminalOutcomes.length,
       replayVerified
     }
   };
@@ -870,6 +1002,7 @@ function cloneStateForMutation(state: FrontierQueueState): FrontierQueueState {
     defaults: { ...state.defaults, retry: { ...state.defaults.retry, retryOn: [...state.defaults.retry.retryOn], nonRetryable: [...state.defaults.retry.nonRetryable] } },
     jobs: state.jobs.map(cloneJob),
     deadLetters: state.deadLetters.map(cloneDeadLetter),
+    terminalOutcomes: state.terminalOutcomes.map(cloneTerminalOutcome),
     events: state.events.map(cloneEvent),
     metadata: cloneObject(state.metadata)
   };
@@ -887,6 +1020,10 @@ function cloneDeadLetter(dead: FrontierQueueDeadLetter): FrontierQueueDeadLetter
   return cloneJson(dead as unknown as JsonValue) as unknown as FrontierQueueDeadLetter;
 }
 
+function cloneTerminalOutcome(outcome: FrontierQueueTerminalOutcome): FrontierQueueTerminalOutcome {
+  return cloneJson(outcome as unknown as JsonValue) as unknown as FrontierQueueTerminalOutcome;
+}
+
 function cloneObject(value?: JsonObject): JsonObject | undefined {
   return value === undefined ? undefined : cloneJson(value) as JsonObject;
 }
@@ -902,6 +1039,7 @@ function patchValues(values: readonly unknown[]): JsonValue[] {
 function compileQueueIndexes(state: FrontierQueueState): QueueIndexes {
   const byId = new Map<string, number>();
   const dedupe = new Map<string, number>();
+  const terminalDedupe = new Map<string, QueueTerminalDedupeMatch>();
   for (let index = 0; index < state.jobs.length; index++) {
     const job = state.jobs[index];
     byId.set(job.id, index);
@@ -909,8 +1047,44 @@ function compileQueueIndexes(state: FrontierQueueState): QueueIndexes {
       const scope = dedupeScope(job.queue, job.dedupeKey);
       if (!dedupe.has(scope)) dedupe.set(scope, index);
     }
+    if (job.dedupeKey && TERMINAL_DEDUPE_STATUSES.has(job.status)) {
+      addTerminalDedupeMatch(terminalDedupe, {
+        queue: job.queue,
+        dedupeKey: job.dedupeKey,
+        status: job.status as FrontierQueueTerminalOutcomeStatus,
+        at: terminalJobAt(job),
+        source: 'job',
+        jobId: job.id,
+        jobIndex: index
+      });
+    }
   }
-  return { byId, dedupe };
+  for (const dead of state.deadLetters) {
+    const dedupeKey = dead.job.dedupeKey;
+    if (!dedupeKey) continue;
+    addTerminalDedupeMatch(terminalDedupe, {
+      queue: dead.queue,
+      dedupeKey,
+      status: 'dead',
+      at: dead.failedAt,
+      source: 'dead-letter',
+      jobId: dead.jobId,
+      reason: dead.reason
+    });
+  }
+  for (const outcome of state.terminalOutcomes) {
+    addTerminalDedupeMatch(terminalDedupe, {
+      queue: outcome.queue,
+      dedupeKey: outcome.dedupeKey,
+      status: outcome.status,
+      at: outcome.at,
+      source: outcome.source || 'terminal-outcome',
+      jobId: outcome.jobId,
+      outcomeId: outcome.id,
+      reason: outcome.reason
+    });
+  }
+  return { byId, dedupe, terminalDedupe };
 }
 
 function createLockedGroups(state: FrontierQueueState): Set<string> {
@@ -983,6 +1157,212 @@ function mergeObjects(left?: JsonObject, right?: JsonObject): JsonObject | undef
 
 function metadataWithDedupeKey(dedupeKey?: string): JsonObject | undefined {
   return dedupeKey ? { dedupeKey } : undefined;
+}
+
+function metadataWithTerminalDedupe(dedupeKey: string, terminal: QueueTerminalDedupeMatch): JsonObject {
+  const metadata: JsonObject = {
+    dedupeKey,
+    terminalStatus: terminal.status,
+    terminalAt: terminal.at,
+    terminalSource: terminal.source
+  };
+  if (terminal.jobId) metadata.terminalJobId = terminal.jobId;
+  if (terminal.outcomeId) metadata.terminalOutcomeId = terminal.outcomeId;
+  if (terminal.reason) metadata.terminalReason = terminal.reason;
+  return metadata;
+}
+
+function collectTerminalOutcomeCandidates(
+  state: FrontierQueueState,
+  input: FrontierQueueTerminalProjectionInput,
+  now: number
+): FrontierQueueTerminalOutcome[] {
+  const candidates: FrontierQueueTerminalOutcome[] = [];
+  const source = input.source || 'projection';
+  const addOutcome = (outcome: FrontierQueueTerminalOutcome | undefined): void => {
+    if (outcome) candidates[candidates.length] = outcome;
+  };
+
+  for (const job of input.jobs || []) addOutcome(terminalOutcomeFromJob(state, job, source));
+  for (const dead of input.deadLetters || []) addOutcome(terminalOutcomeFromDeadLetter(state, dead, source));
+
+  for (const sourceState of input.states || []) {
+    for (const job of sourceState.jobs || []) addOutcome(terminalOutcomeFromJob(state, job, source));
+    for (const dead of sourceState.deadLetters || []) addOutcome(terminalOutcomeFromDeadLetter(state, dead, source));
+    for (const outcome of sourceState.terminalOutcomes || []) {
+      addOutcome(normalizeTerminalOutcomeInput(state, {
+        ...outcome,
+        source: outcome.source || source
+      }, outcome.at));
+    }
+  }
+
+  for (const outcome of input.outcomes || []) {
+    addOutcome(normalizeTerminalOutcomeInput(state, {
+      ...outcome,
+      source: outcome.source || source
+    }, now));
+  }
+
+  candidates.sort(compareTerminalOutcomeSort);
+  return candidates;
+}
+
+function terminalOutcomeFromJob(
+  state: FrontierQueueState,
+  job: FrontierQueueJob,
+  source: string
+): FrontierQueueTerminalOutcome | undefined {
+  if (!job.dedupeKey || !TERMINAL_DEDUPE_STATUSES.has(job.status)) return undefined;
+  const at = terminalJobAt(job);
+  return normalizeTerminalOutcomeInput(state, {
+    queue: job.queue,
+    dedupeKey: job.dedupeKey,
+    status: job.status as FrontierQueueTerminalOutcomeStatus,
+    jobId: job.id,
+    at,
+    source
+  }, at);
+}
+
+function terminalOutcomeFromDeadLetter(
+  state: FrontierQueueState,
+  dead: FrontierQueueDeadLetter,
+  source: string
+): FrontierQueueTerminalOutcome | undefined {
+  if (!dead.job.dedupeKey) return undefined;
+  return normalizeTerminalOutcomeInput(state, {
+    queue: dead.queue,
+    dedupeKey: dead.job.dedupeKey,
+    status: 'dead',
+    jobId: dead.jobId,
+    at: dead.failedAt,
+    source,
+    reason: dead.reason,
+    metadata: dead.metadata
+  }, dead.failedAt);
+}
+
+function normalizeTerminalOutcomeInput(
+  state: FrontierQueueState,
+  input: FrontierQueueTerminalOutcomeInput,
+  fallbackAt: number
+): FrontierQueueTerminalOutcome {
+  if (!input.dedupeKey) throw new TypeError('terminal outcome dedupeKey is required');
+  if (!TERMINAL_OUTCOME_STATUSES.has(input.status)) throw new TypeError('invalid terminal outcome status: ' + input.status);
+  const at = input.at === undefined ? fallbackAt : normalizeTime(input.at);
+  const outcome: FrontierQueueTerminalOutcome = {
+    kind: FRONTIER_QUEUE_TERMINAL_OUTCOME_KIND,
+    version: FRONTIER_QUEUE_TERMINAL_OUTCOME_VERSION,
+    id: '',
+    queue: input.queue || state.defaults.queue,
+    dedupeKey: input.dedupeKey,
+    status: input.status,
+    jobId: input.jobId,
+    at,
+    source: input.source,
+    reason: input.reason,
+    metadata: cloneObject(input.metadata)
+  };
+  outcome.id = input.id || createTerminalOutcomeId(outcome);
+  return outcome;
+}
+
+function createTerminalOutcomeId(outcome: FrontierQueueTerminalOutcome): string {
+  return 'terminal_' + hashQueueValue([
+    outcome.queue,
+    outcome.dedupeKey,
+    outcome.status,
+    outcome.jobId || '',
+    outcome.at,
+    outcome.source || '',
+    outcome.reason || ''
+  ]);
+}
+
+function upsertTerminalOutcome(
+  state: FrontierQueueState,
+  patch: Patch,
+  outcome: FrontierQueueTerminalOutcome | undefined
+): FrontierQueueTerminalOutcome | undefined {
+  if (!outcome) return undefined;
+  const index = findTerminalOutcomeIndex(state, outcome.queue, outcome.dedupeKey);
+  if (index === -1) {
+    const next = cloneTerminalOutcome(outcome);
+    state.terminalOutcomes[state.terminalOutcomes.length] = next;
+    patch[patch.length] = [OP_APPEND, ['terminalOutcomes'], patchValues([cloneTerminalOutcome(next)])];
+    return next;
+  }
+  const existing = state.terminalOutcomes[index];
+  const preferred = preferTerminalOutcome(existing, outcome);
+  if (terminalOutcomesEqual(existing, preferred)) return undefined;
+  const next = cloneTerminalOutcome(preferred);
+  state.terminalOutcomes[index] = next;
+  patch[patch.length] = [OP_SET, ['terminalOutcomes', index], patchValue(cloneTerminalOutcome(next))];
+  return next;
+}
+
+function findTerminalOutcomeIndex(state: FrontierQueueState, queue: string, dedupeKey: string): number {
+  const scope = dedupeScope(queue, dedupeKey);
+  for (let index = 0; index < state.terminalOutcomes.length; index++) {
+    const outcome = state.terminalOutcomes[index];
+    if (dedupeScope(outcome.queue, outcome.dedupeKey) === scope) return index;
+  }
+  return -1;
+}
+
+function terminalOutcomesEqual(left: FrontierQueueTerminalOutcome, right: FrontierQueueTerminalOutcome): boolean {
+  return stableQueueStringify(left) === stableQueueStringify(right);
+}
+
+function preferTerminalOutcome(
+  existing: FrontierQueueTerminalOutcome,
+  next: FrontierQueueTerminalOutcome
+): FrontierQueueTerminalOutcome {
+  return compareTerminalOutcomePreference(next, existing) > 0 ? next : existing;
+}
+
+function addTerminalDedupeMatch(
+  terminalDedupe: Map<string, QueueTerminalDedupeMatch>,
+  match: QueueTerminalDedupeMatch
+): void {
+  const scope = dedupeScope(match.queue, match.dedupeKey);
+  const existing = terminalDedupe.get(scope);
+  if (!existing || compareTerminalMatchPreference(match, existing) > 0) terminalDedupe.set(scope, match);
+}
+
+function compareTerminalOutcomeSort(left: FrontierQueueTerminalOutcome, right: FrontierQueueTerminalOutcome): number {
+  return left.queue.localeCompare(right.queue)
+    || left.dedupeKey.localeCompare(right.dedupeKey)
+    || left.at - right.at
+    || terminalStatusRank(left.status) - terminalStatusRank(right.status)
+    || left.id.localeCompare(right.id);
+}
+
+function compareTerminalOutcomePreference(left: FrontierQueueTerminalOutcome, right: FrontierQueueTerminalOutcome): number {
+  return left.at - right.at
+    || terminalStatusRank(left.status) - terminalStatusRank(right.status)
+    || left.id.localeCompare(right.id);
+}
+
+function compareTerminalMatchPreference(left: QueueTerminalDedupeMatch, right: QueueTerminalDedupeMatch): number {
+  return left.at - right.at
+    || terminalStatusRank(left.status) - terminalStatusRank(right.status)
+    || (left.outcomeId || left.jobId || '').localeCompare(right.outcomeId || right.jobId || '');
+}
+
+function terminalStatusRank(status: FrontierQueueTerminalOutcomeStatus): number {
+  if (status === 'deduped') return 1;
+  if (status === 'cancelled') return 2;
+  if (status === 'completed') return 3;
+  if (status === 'dead') return 4;
+  return 5;
+}
+
+function terminalJobAt(job: FrontierQueueJob): number {
+  if (job.status === 'completed') return job.completedAt || job.updatedAt;
+  if (job.status === 'dead') return job.deadAt || job.failedAt || job.updatedAt;
+  return job.updatedAt;
 }
 
 function dedupeScope(queue: string, key: string): string {

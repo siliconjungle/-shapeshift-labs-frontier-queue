@@ -13,6 +13,7 @@ import {
   failQueueJob,
   inspectQueueState,
   leaseQueueJobs,
+  projectQueueTerminalOutcomes,
   retryQueueDeadLetter,
   verifyQueuePatch
 } from '../dist/index.js';
@@ -67,7 +68,7 @@ let groupState = createQueueState({
 });
 groupState = enqueueQueueJob(groupState, { id: 'alpha-low', groupKey: 'alpha', priority: 1 }, { now: 10 }).state;
 groupState = enqueueQueueJob(groupState, { id: 'alpha-high', groupKey: 'alpha', priority: 2 }, { now: 11 }).state;
-groupState = enqueueQueueJob(groupState, { id: 'solo', priority: 3 }, { now: 12 }).state;
+groupState = enqueueQueueJob(groupState, { id: 'solo', priority: 3, dedupeKey: 'solo' }, { now: 12 }).state;
 groupState = enqueueQueueJob(groupState, { id: 'delayed', priority: 100, delayMs: 1000 }, { now: 12 }).state;
 
 mutation = leaseQueueJobs(groupState, { workerId: 'worker-1', count: 4, now: 20 });
@@ -87,6 +88,20 @@ mutation = completeQueueJob(groupState, {
 });
 assertReplay(groupState, mutation);
 assert.strictEqual(mutation.job.status, 'completed');
+assert.strictEqual(mutation.terminalOutcomes.length, 1);
+assert.strictEqual(mutation.evidence.terminalOutcomeCount, 1);
+groupState = mutation.state;
+
+mutation = enqueueQueueJob(groupState, {
+  id: 'stale-solo',
+  dedupeKey: solo.dedupeKey,
+  dedupeMode: 'drop',
+  payload: { staleManifest: true }
+}, { now: 26 });
+assertReplay(groupState, mutation);
+assert.strictEqual(mutation.outcome, 'terminal-deduped');
+assert.strictEqual(mutation.state.jobs.length, groupState.jobs.length);
+assert.strictEqual(mutation.events[0].metadata.terminalStatus, 'completed');
 groupState = mutation.state;
 
 const alpha = groupState.jobs.find((job) => job.id === 'alpha-high');
@@ -145,6 +160,25 @@ mutation = retryQueueDeadLetter(groupState, { deadLetterId: mutation.deadLetter.
 assertReplay(groupState, mutation);
 assert.strictEqual(mutation.job.status, 'queued');
 groupState = mutation.state;
+
+const remoteTerminalState = createQueueState({ id: 'remote.queue' });
+mutation = projectQueueTerminalOutcomes(remoteTerminalState, {
+  states: [groupState],
+  source: 'remote-snapshot',
+  now: 71
+});
+assertReplay(remoteTerminalState, mutation);
+assert.strictEqual(mutation.outcome, 'terminal-outcomes-projected');
+assert.ok(mutation.state.terminalOutcomes.some((outcome) => outcome.dedupeKey === solo.dedupeKey));
+const projectedTerminalState = mutation.state;
+
+mutation = enqueueQueueJob(projectedTerminalState, {
+  dedupeKey: solo.dedupeKey,
+  dedupeMode: 'drop',
+  payload: { staleManifest: true }
+}, { now: 72 });
+assertReplay(projectedTerminalState, mutation);
+assert.strictEqual(mutation.outcome, 'terminal-deduped');
 
 let stallState = createQueueState({
   id: 'stall.queue',

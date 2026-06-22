@@ -1,6 +1,6 @@
 {
   "name": "@shapeshift-labs/frontier-queue",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Serializable durable queue state, leases, retries, dedupe, dead-letter records, and replay evidence for Frontier apps.",
   "type": "module",
   "license": "MIT",

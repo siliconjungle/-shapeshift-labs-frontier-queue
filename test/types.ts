@@ -4,10 +4,12 @@ import {
   enqueueQueueJob,
   inspectQueueState,
   leaseQueueJobs,
+  projectQueueTerminalOutcomes,
   type FrontierQueueEvidence,
   type FrontierQueueJob,
   type FrontierQueueMutation,
-  type FrontierQueueState
+  type FrontierQueueState,
+  type FrontierQueueTerminalOutcome
 } from '../dist/index.js';
 
 let state: FrontierQueueState = createQueueState({
@@ -39,3 +41,17 @@ if (job) {
 inspectQueueState(state).queues satisfies Record<string, { ready: number }>;
 evidence.replayVerified satisfies boolean;
 enqueued.patch satisfies unknown[];
+
+const projected: FrontierQueueMutation = projectQueueTerminalOutcomes(state, {
+  outcomes: [{
+    queue: 'typed',
+    dedupeKey: 'asset-1',
+    status: 'completed',
+    jobId: job?.id,
+    at: 4,
+    source: 'types'
+  }]
+});
+const outcome: FrontierQueueTerminalOutcome | undefined = projected.terminalOutcomes?.[0];
+outcome?.status satisfies 'completed' | 'dead' | 'cancelled' | 'deduped' | 'rejected';
+projected.evidence.terminalOutcomeCount satisfies number;
